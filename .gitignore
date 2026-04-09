@@ -1,0 +1,22 @@
+# ========================
+# 前端
+# ========================
+frontend/node_modules/
+frontend/dist/
+
+# ========================
+# 后端
+# ========================
+backend/__pycache__/
+backend/*.pyc
+
+# Python虚拟环境
+backend/venv/
+backend/.venv/
+
+# ========================
+# 通用
+# ========================
+.env
+.DS_Store
+.vscode/

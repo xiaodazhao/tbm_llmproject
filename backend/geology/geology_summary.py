@@ -1,4 +1,5 @@
 # geology_summary.py
+import json
 import pandas as pd
 
 
@@ -125,3 +126,82 @@ def geology_summary_to_text(geo_summary: dict):
     if not geo_summary or not geo_summary.get("has_geology", False):
         return "本时段未进行地质融合分析。"
     return geo_summary.get("summary_text", "本时段已完成地质融合分析。")
+
+
+def _safe_load_attrs(x):
+    try:
+        obj = json.loads(x)
+        return obj if isinstance(obj, dict) else {}
+    except Exception:
+        return {}
+
+
+def build_face_geo_text(evidence_df: pd.DataFrame) -> str:
+    """
+    从 evidence_df 中提取掌子面素描（sketch, point）信息，
+    生成“当前掌子面地质情况”描述文本。
+    不改动原有摘要函数，只新增这一项功能。
+    """
+    if evidence_df is None or len(evidence_df) == 0:
+        return "当前掌子面地质情况暂未提供有效资料。"
+
+    if "source_type" not in evidence_df.columns or "source_level" not in evidence_df.columns:
+        return "当前掌子面地质情况暂未提供有效素描资料。"
+
+    sketch_df = evidence_df[
+        (evidence_df["source_type"] == "sketch") &
+        (evidence_df["source_level"] == "point")
+    ].copy()
+
+    if sketch_df.empty:
+        return "当前掌子面地质情况暂未提供有效素描资料。"
+
+    # 取最后一条作为当前掌子面描述
+    row = sketch_df.iloc[-1]
+    attrs = _safe_load_attrs(row.get("attrs_json", ""))
+
+    parts = []
+
+    grade = attrs.get("support_grade") or attrs.get("rock_grade")
+    if grade:
+        parts.append(f"围岩为{grade}级")
+
+    lithology = attrs.get("lithology")
+    if lithology:
+        parts.append(f"岩性为{lithology}")
+
+    weathering = attrs.get("weathering")
+    if weathering:
+        parts.append(f"{weathering}")
+
+    rock_uniformity = attrs.get("rock_uniformity")
+    if rock_uniformity:
+        parts.append(f"岩质{rock_uniformity}")
+
+    joint_degree = attrs.get("joint_degree")
+    if joint_degree:
+        parts.append(f"节理裂隙{joint_degree}")
+
+    rock_mass_state = attrs.get("rock_mass_state")
+    if rock_mass_state:
+        parts.append(f"岩体{rock_mass_state}")
+
+    stability = attrs.get("stability")
+    if stability:
+        parts.append(f"围岩整体稳定性{stability}")
+
+    water_type = attrs.get("water_type")
+    water_flag = attrs.get("water_flag", 0)
+    if water_type:
+        parts.append(f"掌子面存在{water_type}")
+    elif water_flag:
+        parts.append("掌子面存在出水现象")
+
+    collapse_flag = attrs.get("collapse_flag", 0)
+    if collapse_flag:
+        parts.append("局部存在掉块现象")
+
+    if not parts:
+        return "当前掌子面未提取到明确地质特征信息。"
+
+    return "当前掌子面" + "，".join(parts) + "。"

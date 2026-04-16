@@ -5,12 +5,6 @@ import pandas as pd
 from config import TOLERANCE_M
 
 
-RISK_SCORE_MAP = {
-    "low": 1,
-    "medium": 2,
-    "high": 3
-}
-
 GRADE_ORDER = {
     "Ⅰ": 1,
     "Ⅱ": 2,
@@ -25,16 +19,35 @@ GRADE_ORDER = {
 }
 
 
-def get_active(chainage, evidence):
+def get_active(chainage, evidence, point_buffer=5.0):
     """
     获取当前里程命中的所有地质证据
+    - segment / report_conclusion: 按区间命中
+    - point: 按点位缓冲命中
     """
-    return evidence[
-        (evidence["start_num"] - TOLERANCE_M <= chainage) &
-        (evidence["end_num"] + TOLERANCE_M >= chainage)
+    if evidence is None or evidence.empty:
+        return evidence
+
+    if "source_level" not in evidence.columns:
+        return evidence[
+            (evidence["start_num"] - TOLERANCE_M <= chainage) &
+            (evidence["end_num"] + TOLERANCE_M >= chainage)
+        ]
+
+    seg_df = evidence[evidence["source_level"] != "point"].copy()
+    point_df = evidence[evidence["source_level"] == "point"].copy()
+
+    hit_seg = seg_df[
+        (seg_df["start_num"] - TOLERANCE_M <= chainage) &
+        (seg_df["end_num"] + TOLERANCE_M >= chainage)
     ]
 
+    hit_point = point_df[
+        (point_df["start_num"] - point_buffer <= chainage) &
+        (point_df["end_num"] + point_buffer >= chainage)
+    ]
 
+    return pd.concat([hit_seg, hit_point], ignore_index=True)
 def normalize_report_id(report_id: str) -> str:
     """
     规范化报告ID，避免同一报告因命名差异被重复统计
@@ -43,12 +56,10 @@ def normalize_report_id(report_id: str) -> str:
         return ""
 
     report_id = str(report_id).strip()
-
     report_id = re.sub(r"_[0-9]+$", "", report_id)
     report_id = report_id.replace("-_", "_")
     report_id = re.sub(r"[-_]+", "_", report_id)
     report_id = report_id.rstrip("_")
-
     return report_id
 
 
@@ -62,7 +73,7 @@ def _safe_load_attrs(attrs_json_str):
 
 def _normalize_grade(x):
     """
-    统一围岩等级字段，兼容旧字段 rock_grade 和新字段 support_grade
+    统一围岩等级字段
     """
     if x is None:
         return None
@@ -93,9 +104,7 @@ def _normalize_grade(x):
 
 def _record_weight(row, attrs):
     """
-    给不同证据一个简单权重：
-    - 报告结论层 > 普通区段层
-    - 高置信度 > 中 > 低
+    这里只作为“证据强度/可信度”的权重，不再用于风险评定
     """
     weight = 1.0
 
@@ -106,6 +115,8 @@ def _record_weight(row, attrs):
         weight *= 1.20
     elif source_level == "segment":
         weight *= 1.00
+    elif source_level == "point":
+        weight *= 1.10
 
     if confidence == "high":
         weight *= 1.15
@@ -114,7 +125,6 @@ def _record_weight(row, attrs):
     elif confidence == "low":
         weight *= 0.90
 
-    # 若已有冲突/不一致标记，稍降权
     if attrs.get("consistency_flag") == 0:
         weight *= 0.90
     if attrs.get("grade_conflict") == 1:
@@ -123,327 +133,195 @@ def _record_weight(row, attrs):
     return weight
 
 
-def _infer_risk_if_missing(attrs):
-    """
-    当某条证据缺失 risk_level 时，按结构字段兜底推断一个
-    """
-    risk = attrs.get("risk_level")
-    if risk in RISK_SCORE_MAP:
-        return risk
-
-    water_flag = int(bool(attrs.get("water_flag", 0)))
-    collapse_flag = int(bool(attrs.get("collapse_flag", 0)))
-    deformation_flag = int(bool(attrs.get("deformation_flag", 0)))
-
-    water_type = attrs.get("water_type")
-    support_grade = _normalize_grade(
-        attrs.get("support_grade") or attrs.get("rock_grade")
-    )
-    rock_mass_state = str(attrs.get("rock_mass_state", "") or "").strip()
-    joint_degree = str(attrs.get("joint_degree", "") or "").strip()
-    stability = str(attrs.get("stability", "") or "").strip()
-
-    if (
-        collapse_flag == 1
-        or deformation_flag == 1
-        or water_type == "线-股状出水"
-        or rock_mass_state in {"破碎极破碎", "破碎-极破碎", "极破碎"}
-        or (joint_degree == "发育密集" and stability == "较差")
-    ):
-        return "high"
-
-    if (
-        water_flag == 1
-        or support_grade == "Ⅴ"
-        or stability == "较差"
-        or rock_mass_state in {"破碎", "较破碎"}
-        or joint_degree in {"发育", "较发育"}
-    ):
-        return "medium"
-
-    return "low"
+def _pick_mode(values):
+    values = [v for v in values if v not in [None, "", [], {}]]
+    if not values:
+        return None
+    s = pd.Series(values)
+    mode = s.mode()
+    if len(mode) == 0:
+        return values[0]
+    return mode.iloc[0]
 
 
-# =========================
-# 新增：更细的结构化评分
-# =========================
-def _compute_detail_scores(attrs):
-    """
-    把 parser 抽出来的细粒度字段真正转成多个子风险分量
-    输出 0~3 的分值
-    """
-    water_flag = int(bool(attrs.get("water_flag", 0)))
-    collapse_flag = int(bool(attrs.get("collapse_flag", 0)))
-    deformation_flag = int(bool(attrs.get("deformation_flag", 0)))
-    mud_filling_flag = int(bool(attrs.get("mud_filling_flag", 0)))
-
-    water_type = str(attrs.get("water_type", "") or "").strip()
-    support_grade = _normalize_grade(
-        attrs.get("support_grade") or attrs.get("rock_grade")
-    )
-    rock_mass_state = str(attrs.get("rock_mass_state", "") or "").strip()
-    joint_degree = str(attrs.get("joint_degree", "") or "").strip()
-    stability = str(attrs.get("stability", "") or "").strip()
-    rock_uniformity = str(attrs.get("rock_uniformity", "") or "").strip()
-
-    risk_tags = attrs.get("risk_tags", [])
-    if not isinstance(risk_tags, list):
-        risk_tags = []
-
-    # 1) 出水风险
-    if water_type == "线-股状出水":
-        water_risk_score = 3
-    elif water_type in {"股状出水", "线状出水"}:
-        water_risk_score = 2
-    elif water_flag == 1:
-        water_risk_score = 1
-    else:
-        water_risk_score = 0
-
-    # 2) 掉块/变形风险
-    collapse_risk_score = 0
-    if collapse_flag == 1:
-        collapse_risk_score = max(collapse_risk_score, 3)
-    if deformation_flag == 1:
-        collapse_risk_score = max(collapse_risk_score, 3)
-    if "掉块" in risk_tags:
-        collapse_risk_score = max(collapse_risk_score, 2)
-
-    # 3) 围岩质量风险
-    rockmass_risk_score = 0
-    if rock_mass_state in {"破碎极破碎", "破碎-极破碎", "极破碎"}:
-        rockmass_risk_score = max(rockmass_risk_score, 3)
-    elif rock_mass_state in {"破碎", "较破碎"}:
-        rockmass_risk_score = max(rockmass_risk_score, 2)
-
-    if joint_degree == "发育密集":
-        rockmass_risk_score = max(rockmass_risk_score, 3 if rockmass_risk_score >= 2 else 2)
-    elif joint_degree in {"发育", "较发育"}:
-        rockmass_risk_score = max(rockmass_risk_score, 1)
-
-    if stability == "较差":
-        rockmass_risk_score = max(rockmass_risk_score, 2)
-    elif stability == "一般":
-        rockmass_risk_score = max(rockmass_risk_score, 1)
-
-    if mud_filling_flag == 1:
-        rockmass_risk_score = min(3, rockmass_risk_score + 1)
-
-    if rock_uniformity == "软硬不均":
-        rockmass_risk_score = min(3, rockmass_risk_score + 1)
-
-    # 4) 围岩等级风险
-    if support_grade == "Ⅴ":
-        grade_risk_score = 3
-    elif support_grade == "Ⅳ":
-        grade_risk_score = 2
-    elif support_grade == "Ⅲ":
-        grade_risk_score = 1
-    else:
-        grade_risk_score = 0
-
-    return {
-        "water_risk_score": int(min(3, max(0, water_risk_score))),
-        "collapse_risk_score": int(min(3, max(0, collapse_risk_score))),
-        "rockmass_risk_score": int(min(3, max(0, rockmass_risk_score))),
-        "grade_risk_score": int(min(3, max(0, grade_risk_score))),
-    }
+def _pick_worst_grade(grades):
+    grades = [_normalize_grade(g) for g in grades if g]
+    if not grades:
+        return ""
+    return sorted(
+        grades,
+        key=lambda x: GRADE_ORDER.get(str(x), 0),
+        reverse=True
+    )[0]
 
 
-def _detail_scores_to_risk(detail_scores, attrs):
-    """
-    用细粒度分量反推出一条证据的风险等级
-    """
-    m = max(detail_scores.values()) if detail_scores else 0
-    s = sum(detail_scores.values()) if detail_scores else 0
-
-    # 若原始 risk_level 已有，作为参考上界
-    raw_risk = attrs.get("risk_level")
-    raw_score = RISK_SCORE_MAP.get(raw_risk, 0)
-
-    final_score = max(raw_score, 0)
-
-    if m >= 3:
-        final_score = max(final_score, 3)
-    elif s >= 5:
-        final_score = max(final_score, 3)
-    elif m >= 2 or s >= 3:
-        final_score = max(final_score, 2)
-    else:
-        final_score = max(final_score, 1)
-
-    if final_score >= 3:
-        return "high"
-    elif final_score >= 2:
-        return "medium"
-    return "low"
+def _dedup_preserve_order(items):
+    out = []
+    seen = set()
+    for x in items:
+        if x in [None, ""]:
+            continue
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
+    return out
 
 
-def _risk_from_scores(mean_score, max_score):
-    """
-    区分'平均危险程度'与'最坏情形'
-    当前策略偏保守：
-    - 只要 max_score 很高，整体风险不低于 medium/high
-    """
-    if max_score >= 2.8:
-        return "high"
-    if mean_score >= 2.4:
-        return "high"
-    if max_score >= 2.2:
-        return "medium"
-    if mean_score >= 1.8:
-        return "medium"
-    return "low"
-
-
-def fuse(chainage, df):
-    """
-    对某一里程的命中证据进行融合
-    """
-    # ===== 无证据 =====
-    if df.empty:
-        return {
-            "chainage": chainage,
-            "coverage": "none",
-            "risk": "low",
-            "risk_score": 1,
-            "hazard": "无明显异常",
-            "water_flag_fused": 0,
-            "collapse_flag_fused": 0,
-            "deformation_flag_fused": 0,
-            "active_source_count": 0,
-            "active_sources": "",
-            "active_evidence_ids": "",
-            "active_report_ids": "",
-            "fused_grade": "",
-            "uncertainty": "high",
-            "water_risk_score": 0,
-            "collapse_risk_score": 0,
-            "rockmass_risk_score": 0,
-            "grade_risk_score": 0,
-            "detail_score_mean": 0.0,
-            "detail_score_max": 0.0,
-        }
-
-    parsed_rows = []
-    for _, row in df.iterrows():
-        attrs = _safe_load_attrs(row.get("attrs_json", ""))
-        parsed_rows.append((row, attrs))
-
-    # ===== 逐条证据：细粒度评分 + 加权风险 =====
-    weighted_scores = []
-    total_weight = 0.0
-    raw_scores = []
-
-    water_score_weighted = 0.0
-    collapse_score_weighted = 0.0
-    rockmass_score_weighted = 0.0
-    grade_score_weighted = 0.0
-
-    water_score_max = 0
-    collapse_score_max = 0
-    rockmass_score_max = 0
-    grade_score_max = 0
-
-    for row, attrs in parsed_rows:
-        detail_scores = _compute_detail_scores(attrs)
-        inferred_risk = _detail_scores_to_risk(detail_scores, attrs)
-
-        # 双保险：如果细粒度没覆盖到，再走旧兜底
-        if inferred_risk not in RISK_SCORE_MAP:
-            inferred_risk = _infer_risk_if_missing(attrs)
-
-        score = RISK_SCORE_MAP.get(inferred_risk, 1)
-        weight = _record_weight(row, attrs)
-
-        weighted_scores.append(score * weight)
-        raw_scores.append(score)
-        total_weight += weight
-
-        water_score_weighted += detail_scores["water_risk_score"] * weight
-        collapse_score_weighted += detail_scores["collapse_risk_score"] * weight
-        rockmass_score_weighted += detail_scores["rockmass_risk_score"] * weight
-        grade_score_weighted += detail_scores["grade_risk_score"] * weight
-
-        water_score_max = max(water_score_max, detail_scores["water_risk_score"])
-        collapse_score_max = max(collapse_score_max, detail_scores["collapse_risk_score"])
-        rockmass_score_max = max(rockmass_score_max, detail_scores["rockmass_risk_score"])
-        grade_score_max = max(grade_score_max, detail_scores["grade_risk_score"])
-
-    if total_weight <= 0:
-        risk = "low"
-        mean_score = 1.0
-        max_score = 1.0
-    else:
-        mean_score = sum(weighted_scores) / total_weight
-        max_score = max(raw_scores) if raw_scores else 1.0
-        risk = _risk_from_scores(mean_score, max_score)
-
-    risk_score = RISK_SCORE_MAP.get(risk, 1)
-
-    # ===== 灾害融合 =====
-    hazard_set = set()
-    grades = []
-
-    water_flag_fused = 0
-    collapse_flag_fused = 0
-    deformation_flag_fused = 0
+def _merge_hazard_tags(parsed_rows):
+    hazard_set = []
 
     for row, attrs in parsed_rows:
         water_type = attrs.get("water_type")
         if water_type:
-            hazard_set.add(str(water_type))
-            water_flag_fused = 1
+            hazard_set.append(str(water_type))
         elif attrs.get("water_flag"):
-            hazard_set.add("出水")
-            water_flag_fused = 1
+            hazard_set.append("出水")
 
         if attrs.get("collapse_flag"):
-            hazard_set.add("掉块")
-            collapse_flag_fused = 1
+            hazard_set.append("掉块")
 
         if attrs.get("deformation_flag"):
-            hazard_set.add("变形")
-            deformation_flag_fused = 1
+            hazard_set.append("变形")
 
         tags = attrs.get("risk_tags", [])
         if isinstance(tags, list):
             for t in tags:
                 if t:
-                    hazard_set.add(str(t))
+                    hazard_set.append(str(t))
 
-        grade = _normalize_grade(
-            attrs.get("support_grade") or attrs.get("rock_grade")
-        )
-        if grade:
-            grades.append(grade)
+    hazard_list = _dedup_preserve_order(hazard_set)
+    return hazard_list, "+".join(hazard_list) if hazard_list else "无明显异常"
 
-    hazard = "+".join(sorted(hazard_set)) if hazard_set else "无明显异常"
 
-    # ===== 围岩等级融合（从严原则）=====
-    fused_grade = ""
-    if grades:
-        fused_grade = sorted(
-            grades,
-            key=lambda x: GRADE_ORDER.get(str(x), 0),
-            reverse=True
-        )[0]
+def _merge_water_type(parsed_rows):
+    vals = []
+    for _, attrs in parsed_rows:
+        x = attrs.get("water_type")
+        if x:
+            vals.append(str(x))
+    vals = _dedup_preserve_order(vals)
+    return ";".join(vals) if vals else None
 
-    # ===== 按 source_type + report_id 去重统计 =====
+
+def _weighted_mean(values, weights):
+    pairs = [(v, w) for v, w in zip(values, weights) if v is not None]
+    if not pairs:
+        return None
+    total_w = sum(w for _, w in pairs)
+    if total_w <= 0:
+        return None
+    return round(sum(v * w for v, w in pairs) / total_w, 4)
+
+
+def _count_true_flags(parsed_rows, key):
+    vals = []
+    for _, attrs in parsed_rows:
+        vals.append(1 if attrs.get(key) else 0)
+    return int(sum(vals))
+
+
+def _merge_field_mode(parsed_rows, key):
+    vals = []
+    for _, attrs in parsed_rows:
+        x = attrs.get(key)
+        if x not in [None, ""]:
+            vals.append(x)
+    return _pick_mode(vals)
+
+
+def fuse(chainage, df):
+    """
+    对某一里程的命中证据进行融合
+    —— 只做“事实融合”，不做风险评定
+    """
+    if df.empty:
+        return {
+            "chainage": chainage,
+            "coverage": "none",
+
+            # 事实型输出
+            "hazard": "无明显异常",
+            "hazard_list": "",
+            "fused_grade": "",
+            "water_flag_fused": 0,
+            "water_type_fused": None,
+            "collapse_flag_fused": 0,
+            "deformation_flag_fused": 0,
+            "joint_degree_fused": None,
+            "rock_mass_state_fused": None,
+            "rock_uniformity_fused": None,
+            "weathering_fused": None,
+            "stability_fused": None,
+            "lithology_fused": None,
+
+            # 来源与命中
+            "active_source_count": 0,
+            "active_sources": "",
+            "active_evidence_ids": "",
+            "active_report_ids": "",
+            "active_source_levels": "",
+            "uncertainty": "high",
+
+            # 证据统计
+            "evidence_count": 0,
+            "weighted_evidence_strength": 0.0,
+            "grade_count": 0,
+            "water_evidence_count": 0,
+            "collapse_evidence_count": 0,
+            "deformation_evidence_count": 0,
+        }
+
+    parsed_rows = []
+    weights = []
+    for _, row in df.iterrows():
+        attrs = _safe_load_attrs(row.get("attrs_json", ""))
+        parsed_rows.append((row, attrs))
+        weights.append(_record_weight(row, attrs))
+
+    # ===== 字段融合 =====
+    grades = []
+    for _, attrs in parsed_rows:
+        g = _normalize_grade(attrs.get("support_grade") or attrs.get("rock_grade"))
+        if g:
+            grades.append(g)
+
+    fused_grade = _pick_worst_grade(grades)
+
+    water_flag_fused = 1 if _count_true_flags(parsed_rows, "water_flag") > 0 else 0
+    collapse_flag_fused = 1 if _count_true_flags(parsed_rows, "collapse_flag") > 0 else 0
+    deformation_flag_fused = 1 if _count_true_flags(parsed_rows, "deformation_flag") > 0 else 0
+
+    water_type_fused = _merge_water_type(parsed_rows)
+    joint_degree_fused = _merge_field_mode(parsed_rows, "joint_degree")
+    rock_mass_state_fused = _merge_field_mode(parsed_rows, "rock_mass_state")
+    rock_uniformity_fused = _merge_field_mode(parsed_rows, "rock_uniformity")
+    weathering_fused = _merge_field_mode(parsed_rows, "weathering")
+    stability_fused = _merge_field_mode(parsed_rows, "stability")
+    lithology_fused = _merge_field_mode(parsed_rows, "lithology")
+
+    hazard_list, hazard = _merge_hazard_tags(parsed_rows)
+
+    # ===== 来源统计 =====
     unique_report_keys = set()
     unique_report_ids = set()
+    unique_sources = set()
+    unique_levels = set()
 
     for _, row in df.iterrows():
         source_type = str(row.get("source_type", "")).strip()
+        source_level = str(row.get("source_level", "")).strip()
         report_id = normalize_report_id(row.get("report_id", ""))
+
         unique_report_keys.add((source_type, report_id))
         if report_id:
             unique_report_ids.add(report_id)
+        if source_type:
+            unique_sources.add(source_type)
+        if source_level:
+            unique_levels.add(source_level)
 
     active_source_count = len(unique_report_keys)
-    unique_sources = sorted(set(df["source_type"].astype(str)))
 
-    # ===== 不确定性 =====
     if active_source_count >= 3:
         uncertainty = "low"
     elif active_source_count == 2:
@@ -451,50 +329,48 @@ def fuse(chainage, df):
     else:
         uncertainty = "high"
 
-    # ===== 子分量融合输出 =====
-    if total_weight > 0:
-        water_risk_score = round(water_score_weighted / total_weight, 2)
-        collapse_risk_score = round(collapse_score_weighted / total_weight, 2)
-        rockmass_risk_score = round(rockmass_score_weighted / total_weight, 2)
-        grade_risk_score = round(grade_score_weighted / total_weight, 2)
-    else:
-        water_risk_score = 0.0
-        collapse_risk_score = 0.0
-        rockmass_risk_score = 0.0
-        grade_risk_score = 0.0
+    # ===== 证据统计 =====
+    evidence_count = len(parsed_rows)
+    weighted_evidence_strength = round(sum(weights), 4)
 
-    detail_score_mean = round(
-        (water_risk_score + collapse_risk_score + rockmass_risk_score + grade_risk_score) / 4.0,
-        2
-    )
-    detail_score_max = round(
-        max(water_score_max, collapse_score_max, rockmass_score_max, grade_score_max),
-        2
-    )
+    water_evidence_count = _count_true_flags(parsed_rows, "water_flag")
+    collapse_evidence_count = _count_true_flags(parsed_rows, "collapse_flag")
+    deformation_evidence_count = _count_true_flags(parsed_rows, "deformation_flag")
 
     return {
         "chainage": chainage,
         "coverage": "multi" if active_source_count > 1 else "single",
-        "risk": risk,
-        "risk_score": risk_score,
+
+        # 事实型输出
         "hazard": hazard,
+        "hazard_list": ";".join(hazard_list),
+        "fused_grade": fused_grade,
         "water_flag_fused": water_flag_fused,
+        "water_type_fused": water_type_fused,
         "collapse_flag_fused": collapse_flag_fused,
         "deformation_flag_fused": deformation_flag_fused,
+        "joint_degree_fused": joint_degree_fused,
+        "rock_mass_state_fused": rock_mass_state_fused,
+        "rock_uniformity_fused": rock_uniformity_fused,
+        "weathering_fused": weathering_fused,
+        "stability_fused": stability_fused,
+        "lithology_fused": lithology_fused,
+
+        # 来源与命中
         "active_source_count": active_source_count,
-        "active_sources": ";".join(unique_sources),
+        "active_sources": ";".join(sorted(unique_sources)),
         "active_evidence_ids": ";".join(df["evidence_id"].astype(str).tolist()),
         "active_report_ids": ";".join(sorted(unique_report_ids)),
-        "fused_grade": fused_grade,
+        "active_source_levels": ";".join(sorted(unique_levels)),
         "uncertainty": uncertainty,
 
-        # 新增，更细粒度的融合输出
-        "water_risk_score": water_risk_score,
-        "collapse_risk_score": collapse_risk_score,
-        "rockmass_risk_score": rockmass_risk_score,
-        "grade_risk_score": grade_risk_score,
-        "detail_score_mean": detail_score_mean,
-        "detail_score_max": detail_score_max,
+        # 证据统计
+        "evidence_count": evidence_count,
+        "weighted_evidence_strength": weighted_evidence_strength,
+        "grade_count": len(grades),
+        "water_evidence_count": water_evidence_count,
+        "collapse_evidence_count": collapse_evidence_count,
+        "deformation_evidence_count": deformation_evidence_count,
     }
 
 

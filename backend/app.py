@@ -44,6 +44,8 @@ from llm.llm_api import call_llm
 
 from utils.time_window_utils import load_df_by_time
 
+from geology.geology_summary import build_face_geo_text
+
 
 # =========================
 # FastAPI 初始化
@@ -232,7 +234,7 @@ def analyze_tbm_data(df: pd.DataFrame):
         typical_segments_df = build_typical_segments_table(segment_df, top_n=20)
         geo_summary_segment = summarize_geology_segment_level(segment_df)
         geo_text = geology_summary_to_text(geo_summary_segment)
-
+        face_geo_text = build_face_geo_text(evidence_df)
         forward_risk_summary = generate_forward_risk_summary(
             df_plc=df_geo,
             evidence_df=evidence_df,
@@ -379,6 +381,7 @@ def analyze_tbm_data(df: pd.DataFrame):
         "forward_risk_summary": forward_risk_summary,
         "forward_risk_text": forward_risk_text,
         "llm_summary": llm_summary,
+        "face_geo_text": face_geo_text,
     }
 
 
@@ -579,8 +582,10 @@ def generate_daily_report(req: DailyReportRequest):
             state_stats_text=result["state_stats_text"],
             gas_text=result["gas_text"],
             geo_text=result["geo_text"],
+            face_geo_text=result["face_geo_text"],
             llm_summary=result["llm_summary"]
         )
+        
 
         report = call_llm(prompt)
         return {"report": report}

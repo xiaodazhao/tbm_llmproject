@@ -1,151 +1,70 @@
 import os
+from dotenv import load_dotenv
+from google import genai
 
-import time
-import traceback
-import requests
+# =========================================================
+# 1. 初始化配置
+# =========================================================
+load_dotenv()
 
-# =========================================
-# 可切换配置
-# =========================================
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "ollama").lower()
+API_KEY = os.getenv("GOOGLE_API_KEY")
 
-# ===== Ollama =====
-OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5-coder:7b")
+if not API_KEY:
+    raise ValueError("❌ 未找到 GOOGLE_API_KEY，请检查 .env 文件！")
 
-# ===== Gemini =====
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-GEMINI_BASE_URL = os.getenv(
-    "GEMINI_BASE_URL",
-    "https://generativelanguage.googleapis.com/v1beta/models"
-)
+client = genai.Client(api_key=API_KEY)
 
-# ===== 通用参数 =====
-REQUEST_TIMEOUT = int(os.getenv("LLM_TIMEOUT", "120"))
-LLM_RETRY = int(os.getenv("LLM_RETRY", "1"))
+DEFAULT_MODEL = "gemini-2.5-flash-lite"
 
 
-# =========================================
-# 通用重试包装
-# =========================================
-def _retry_call(func, *args, retry=1, **kwargs):
-    last_err = None
-    for i in range(retry + 1):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            last_err = e
-            print(f"⚠️ 第 {i + 1} 次调用失败: {e}")
-            if i < retry:
-                time.sleep(1.5)
-    raise last_err
-
-
-# =========================================
-# Ollama
-# =========================================
-def call_ollama(prompt: str) -> str:
-    url = f"{OLLAMA_BASE_URL}/api/chat"
-
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        "stream": False,
-        "options": {
-            "temperature": 0.1
-        },
-        "keep_alive": "10m"
-    }
-
-    resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-
-    data = resp.json()
-
-    # 正常情况下 Ollama chat 返回 data["message"]["content"]
-    if "message" in data and "content" in data["message"]:
-        return data["message"]["content"]
-
-    raise ValueError(f"Ollama 返回格式异常: {data}")
-
-
-# =========================================
-# Gemini
-# =========================================
-def call_gemini(prompt: str) -> str:
-    if not GEMINI_API_KEY:
-        raise ValueError("未设置 GEMINI_API_KEY")
-
-    url = f"{GEMINI_BASE_URL}/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ],
-        "generationConfig": {
-            "temperature": 0.1
-        }
-    }
-
-    resp = requests.post(url, json=payload, timeout=REQUEST_TIMEOUT)
-    resp.raise_for_status()
-
-    data = resp.json()
-
-    # Gemini 常见返回路径
-    candidates = data.get("candidates", [])
-    if candidates:
-        content = candidates[0].get("content", {})
-        parts = content.get("parts", [])
-        if parts and "text" in parts[0]:
-            return parts[0]["text"]
-
-    raise ValueError(f"Gemini 返回格式异常: {data}")
-
-
-# =========================================
-# 统一入口
-# =========================================
-def call_llm(prompt: str) -> str:
+# =========================================================
+# 2. 通用 LLM 调用函数
+# =========================================================
+def call_llm(prompt: str, model: str = DEFAULT_MODEL) -> str:
+    """
+    调用 Google Gemini 生成文本
+    """
     try:
-        if LLM_PROVIDER == "ollama":
-            return _retry_call(call_ollama, prompt, retry=LLM_RETRY)
+        response = client.models.generate_content(
+            model=model,
+            contents=prompt,
+            config={
+                "temperature": 0.3,
+                "max_output_tokens": 8192
+            }
+        )
 
-        if LLM_PROVIDER == "gemini":
-            return _retry_call(call_gemini, prompt, retry=LLM_RETRY)
+        if hasattr(response, "text") and response.text:
+            return response.text.strip()
 
-        raise ValueError(f"不支持的 LLM_PROVIDER: {LLM_PROVIDER}")
+        return "⚠️ 模型返回了空内容"
 
     except Exception as e:
         print(f"❌ LLM 调用报错: {e}")
-        traceback.print_exc()
         return f"[LLM Error] {e}"
 
 
-# =========================================
-# 本地测试入口
-# =========================================
-if __name__ == "__main__":
-    test_prompt = "请只回复：测试成功"
+# =========================================================
+# 3. RAG 专用调用
+# =========================================================
+def call_llm_rag(query: str, context: str, model: str = DEFAULT_MODEL) -> str:
+    """
+    RAG 调用封装：自动把 context 和 query 拼接
+    """
+    prompt = f"""
+你是一名专业的 TBM（隧道掘进机）施工数据分析师。
+请根据以下【监测数据背景】回答【分析任务】。
 
-    print(f"当前 LLM_PROVIDER = {LLM_PROVIDER}")
-    if LLM_PROVIDER == "ollama":
-        print(f"当前 OLLAMA_MODEL = {OLLAMA_MODEL}")
-    elif LLM_PROVIDER == "gemini":
-        print(f"当前 GEMINI_MODEL = {GEMINI_MODEL}")
+【监测数据背景】
+{context}
 
-    result = call_llm(test_prompt)
-    print("\n模型返回：")
-    print(result)
+【分析任务】
+{query}
+
+要求：
+1. 语言专业、客观、工程化。
+2. 若存在异常停机、频繁启停、状态波动或气体异常，应重点指出。
+3. 严格依据输入数据，不得虚构。
+4. 控制在 2000 字以内。
+"""
+    return call_llm(prompt, model=model)

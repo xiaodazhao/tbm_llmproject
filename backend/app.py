@@ -220,6 +220,73 @@ def choose_state_params(n_valid: int):
         }
 
 
+def risk_probability_to_text(df_geo):
+    """
+    简化版：基于已有字段生成风险评估文字
+    不依赖 risk_prob / risk_prob_smooth
+    """
+    try:
+        if df_geo is None or df_geo.empty:
+            return "未进行区段风险概率评估分析。"
+
+        df = df_geo.copy()
+
+        if "chainage" not in df.columns:
+            return "缺少里程信息，无法进行区段风险概率分析。"
+
+        df["chainage"] = pd.to_numeric(df["chainage"], errors="coerce")
+        df = df.dropna(subset=["chainage"]).copy()
+
+        if df.empty:
+            return "缺少有效里程数据，无法进行区段风险概率分析。"
+
+        score = pd.Series(0.0, index=df.index)
+
+        if "active_source_count" in df.columns:
+            score += pd.to_numeric(df["active_source_count"], errors="coerce").fillna(0)
+
+        if "risk_score" in df.columns:
+            score += pd.to_numeric(df["risk_score"], errors="coerce").fillna(0)
+
+        if "weighted_evidence_strength" in df.columns:
+            score += pd.to_numeric(df["weighted_evidence_strength"], errors="coerce").fillna(0)
+
+        df["risk_prob_like"] = score
+
+        top = (
+            df.sort_values("risk_prob_like", ascending=False)
+              .drop_duplicates(subset=["chainage"])
+              .head(5)
+        )
+
+        if top.empty or float(top["risk_prob_like"].fillna(0).max()) <= 0:
+            return "基于现有多源地质信息，当前未识别出表现特别突出的高关注区段，整体风险评估结果相对平稳。"
+
+        lines = []
+        lines.append("基于多源地质信息及区段响应特征，对沿线区段进行了综合风险评估。结果表明：")
+
+        for _, row in top.iterrows():
+            ch = row["chainage"]
+            active_cnt = int(pd.to_numeric(row.get("active_source_count", 0), errors="coerce") or 0)
+            hazard = str(row.get("hazard", "")).strip()
+
+            text = f"里程约 DK{ch/1000:.3f} 附近区段表现出相对较高关注特征"
+            if active_cnt > 0:
+                text += f"，多源关注数为 {active_cnt}"
+            if hazard and hazard.lower() != "nan":
+                text += f"，主要关注表现为{hazard}"
+            text += "。"
+            lines.append(text)
+
+        lines.append(
+            "总体来看，上述结果反映的是多源信息综合关注程度，不代表实际灾害已发生，相关结论仍需结合现场监测、掌子面揭示情况及施工响应进一步核实。"
+        )
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        print("[Risk Prob Text Error]", e)
+        return "区段风险概率分析不可用。"
 # =========================
 # 核心分析引擎
 # =========================
@@ -355,7 +422,7 @@ def analyze_tbm_data(df: pd.DataFrame):
         "有效状态样本数": n_valid,
         "状态识别配置": state_cfg
     }
-
+    risk_prob_text = risk_probability_to_text(df_geo)
     return {
         "segments": segments,
         "seg_text": seg_text,
@@ -382,6 +449,7 @@ def analyze_tbm_data(df: pd.DataFrame):
         "forward_risk_text": forward_risk_text,
         "llm_summary": llm_summary,
         "face_geo_text": face_geo_text,
+        "risk_prob_text": risk_prob_text,
     }
 
 
@@ -552,6 +620,7 @@ def build_speed_profile(df_geo: pd.DataFrame):
     return serialize_for_json(grp.to_dict(orient="records"))
 
 
+
 # =========================
 # API 接口
 # =========================
@@ -583,7 +652,8 @@ def generate_daily_report(req: DailyReportRequest):
             gas_text=result["gas_text"],
             geo_text=result["geo_text"],
             face_geo_text=result["face_geo_text"],
-            llm_summary=result["llm_summary"]
+            llm_summary=result["llm_summary"],
+            risk_prob_text=result["risk_prob_text"] 
         )
         
 

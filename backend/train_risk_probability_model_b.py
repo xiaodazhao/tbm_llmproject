@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-train_risk_probability_model_b_v2.py
+train_risk_probability_model_b_v3.py
 
-改进版：地质证据 + 后续施工响应 联合定义风险标签
+升级版：地质证据 + 后续施工响应 联合定义风险标签
 ------------------------------------------------
-核心思想：
-1. 当前区段先计算“地质风险先验”
-2. 再看后续一段距离内施工是否明显恶化
-3. 只有“地质先验较高 + 后续施工恶化”，才定义为高风险
-4. 用当前区段特征预测该风险概率
+增强点：
+1. 保留地质融合缓存
+2. 保留区段级特征
+3. 增加趋势特征（前后段变化）
+4. 增加风险平滑（rolling）
+5. 增加风险等级划分（低/中/高）
+6. 增加更适合汇报的可视化输出
+7. 地质先验评分改为工程级门控逻辑
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ import joblib
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.ticker as mticker
 
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -90,6 +94,46 @@ def ensure_time_chainage(df: pd.DataFrame) -> pd.DataFrame:
     return out.reset_index(drop=True)
 
 
+def build_fused_cache_path(plc_path: str, output_dir: str | Path) -> Path:
+    plc_name = Path(plc_path).stem
+    output_dir = Path(output_dir)
+    cache_dir = output_dir / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    return cache_dir / f"{plc_name}_geo_fused.parquet"
+
+
+def load_or_build_fused_df(
+    plc_path: str,
+    evidence_db_path: str,
+    output_dir: str | Path,
+    force_rebuild: bool = False,
+) -> pd.DataFrame:
+    cache_path = build_fused_cache_path(plc_path, output_dir)
+
+    if cache_path.exists() and not force_rebuild:
+        print(f"[INFO] 读取融合缓存: {cache_path}")
+        df_geo = pd.read_parquet(cache_path)
+        df_geo = ensure_time_chainage(df_geo)
+        return df_geo
+
+    print(f"[INFO] 未找到融合缓存，开始读取原始 PLC: {plc_path}")
+    plc_df = pd.read_csv(plc_path)
+    plc_df = ensure_time_chainage(plc_df)
+    print(f"[INFO] PLC 样本数: {len(plc_df)}")
+
+    print(f"[INFO] 读取证据库: {evidence_db_path}")
+    evidence_df = load_evidence_db(evidence_db_path)
+
+    print("[INFO] 挂接地质融合标签...")
+    df_geo = attach_geology_labels(plc_df, evidence_df)
+    df_geo = ensure_time_chainage(df_geo)
+
+    print(f"[INFO] 保存融合缓存: {cache_path}")
+    df_geo.to_parquet(cache_path, index=False)
+
+    return df_geo
+
+
 def safe_mode(series: pd.Series):
     s = series.dropna()
     if s.empty:
@@ -101,9 +145,6 @@ def safe_mode(series: pd.Series):
 
 
 def get_col(df: pd.DataFrame, *names, default=0):
-    """
-    按顺序尝试取列；若都不存在，返回一个默认 Series
-    """
     for name in names:
         if name in df.columns:
             return df[name]
@@ -192,52 +233,49 @@ def build_segment_features(df: pd.DataFrame) -> pd.DataFrame:
         ]
 
     rename_map = {
-    # 施工特征
-    "推进速度_mean": "speed_mean",
-    "推进速度_std": "speed_std",
-    "推进速度_median": "speed_median",
-    "推进速度_min": "speed_min",
-    "推进速度_max": "speed_max",
-    "推力_mean": "thrust_mean",
-    "推力_std": "thrust_std",
-    "推力_median": "thrust_median",
-    "推力_max": "thrust_max",
-    "刀盘扭矩_mean": "torque_mean",
-    "刀盘扭矩_std": "torque_std",
-    "刀盘扭矩_median": "torque_median",
-    "刀盘扭矩_max": "torque_max",
-    "刀盘实际转速_mean": "rpm_mean",
-    "刀盘实际转速_std": "rpm_std",
-    "刀盘实际转速_median": "rpm_median",
-    "刀盘实际转速_max": "rpm_max",
-    "is_stop_mean": "stop_ratio",
-    "is_work_mean": "work_ratio",
+        "推进速度_mean": "speed_mean",
+        "推进速度_std": "speed_std",
+        "推进速度_median": "speed_median",
+        "推进速度_min": "speed_min",
+        "推进速度_max": "speed_max",
+        "推力_mean": "thrust_mean",
+        "推力_std": "thrust_std",
+        "推力_median": "thrust_median",
+        "推力_max": "thrust_max",
+        "刀盘扭矩_mean": "torque_mean",
+        "刀盘扭矩_std": "torque_std",
+        "刀盘扭矩_median": "torque_median",
+        "刀盘扭矩_max": "torque_max",
+        "刀盘实际转速_mean": "rpm_mean",
+        "刀盘实际转速_std": "rpm_std",
+        "刀盘实际转速_median": "rpm_median",
+        "刀盘实际转速_max": "rpm_max",
+        "is_stop_mean": "stop_ratio",
+        "is_work_mean": "work_ratio",
 
-    # 地质数值特征
-    "active_source_count_max": "active_source_count",
-    "weighted_evidence_strength_max": "weighted_evidence_strength",
-    "evidence_count_max": "evidence_count",
-    "grade_count_max": "grade_count",
-    "water_evidence_count_max": "water_evidence_count",
-    "collapse_evidence_count_max": "collapse_evidence_count",
-    "deformation_evidence_count_max": "deformation_evidence_count",
-    "water_flag_fused_max": "water_flag_fused",
-    "collapse_flag_fused_max": "collapse_flag_fused",
-    "deformation_flag_fused_max": "deformation_flag_fused",
+        "active_source_count_max": "active_source_count",
+        "weighted_evidence_strength_max": "weighted_evidence_strength",
+        "evidence_count_max": "evidence_count",
+        "grade_count_max": "grade_count",
+        "water_evidence_count_max": "water_evidence_count",
+        "collapse_evidence_count_max": "collapse_evidence_count",
+        "deformation_evidence_count_max": "deformation_evidence_count",
+        "water_flag_fused_max": "water_flag_fused",
+        "collapse_flag_fused_max": "collapse_flag_fused",
+        "deformation_flag_fused_max": "deformation_flag_fused",
 
-    # 地质类别特征（safe_mode 后缀改回原名）
-    "fused_grade_safe_mode": "fused_grade",
-    "hazard_safe_mode": "hazard",
-    "uncertainty_safe_mode": "uncertainty",
-    "coverage_safe_mode": "coverage",
-    "water_type_fused_safe_mode": "water_type_fused",
-    "joint_degree_fused_safe_mode": "joint_degree_fused",
-    "rock_mass_state_fused_safe_mode": "rock_mass_state_fused",
-    "rock_uniformity_fused_safe_mode": "rock_uniformity_fused",
-    "weathering_fused_safe_mode": "weathering_fused",
-    "stability_fused_safe_mode": "stability_fused",
-    "lithology_fused_safe_mode": "lithology_fused",
-}
+        "fused_grade_safe_mode": "fused_grade",
+        "hazard_safe_mode": "hazard",
+        "uncertainty_safe_mode": "uncertainty",
+        "coverage_safe_mode": "coverage",
+        "water_type_fused_safe_mode": "water_type_fused",
+        "joint_degree_fused_safe_mode": "joint_degree_fused",
+        "rock_mass_state_fused_safe_mode": "rock_mass_state_fused",
+        "rock_uniformity_fused_safe_mode": "rock_uniformity_fused",
+        "weathering_fused_safe_mode": "weathering_fused",
+        "stability_fused_safe_mode": "stability_fused",
+        "lithology_fused_safe_mode": "lithology_fused",
+    }
     seg = seg.rename(columns=rename_map)
 
     if "fused_grade" in seg.columns:
@@ -248,49 +286,177 @@ def build_segment_features(df: pd.DataFrame) -> pd.DataFrame:
     return seg
 
 
+def add_trend_features(seg_df: pd.DataFrame) -> pd.DataFrame:
+    seg = seg_df.copy().sort_values("segment_start").reset_index(drop=True)
+
+    trend_cols = [
+        "speed_mean", "speed_std",
+        "thrust_mean", "thrust_std",
+        "torque_mean", "torque_std",
+        "stop_ratio", "work_ratio",
+        "rpm_mean", "rpm_std",
+    ]
+
+    for col in trend_cols:
+        if col in seg.columns:
+            seg[f"{col}_diff1"] = seg[col].diff()
+            seg[f"{col}_pct_change"] = seg[col].pct_change().replace([np.inf, -np.inf], np.nan)
+
+    if "speed_mean" in seg.columns and "torque_mean" in seg.columns:
+        seg["speed_torque_ratio"] = seg["speed_mean"] / (seg["torque_mean"] + 1e-6)
+
+    if "speed_mean" in seg.columns and "thrust_mean" in seg.columns:
+        seg["speed_thrust_ratio"] = seg["speed_mean"] / (seg["thrust_mean"] + 1e-6)
+
+    if "speed_std" in seg.columns and "speed_mean" in seg.columns:
+        seg["speed_volatility"] = seg["speed_std"] / (seg["speed_mean"].abs() + 1e-6)
+
+    return seg
+
+
 # =========================
-# 地质先验评分
+# 地质先验评分（完整版修订）
 # =========================
 def build_geology_prior(seg_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    工程级改进版 geo_prior_score（最终修订版）
+
+    逻辑：
+    1. grade_score：围岩等级基础分
+    2. consensus_score：多源一致性分
+    3. hazard_score：危险组合门控分
+       - 强危险必须更难触发
+       - 中危险也要求有一定证据支撑
+       - 危险项不再简单堆词累加
+    """
     seg = seg_df.copy()
 
-    active_source = get_col(seg, "active_source_count", "active_source_count_max")
-    water_flag = get_col(seg, "water_flag_fused", "water_flag_fused_max")
-    collapse_flag = get_col(seg, "collapse_flag_fused", "collapse_flag_fused_max")
-    deformation_flag = get_col(seg, "deformation_flag_fused", "deformation_flag_fused_max")
-    weighted_strength = get_col(seg, "weighted_evidence_strength", "weighted_evidence_strength_max")
+    active_source = get_col(seg, "active_source_count", default=0).fillna(0)
+    weighted_strength = get_col(seg, "weighted_evidence_strength", default=0).fillna(0)
 
-    seg["geo_prior_score"] = 0.0
+    water_flag = get_col(seg, "water_flag_fused", default=0).fillna(0)
+    collapse_flag = get_col(seg, "collapse_flag_fused", default=0).fillna(0)
+    deformation_flag = get_col(seg, "deformation_flag_fused", default=0).fillna(0)
 
+    # 1) 围岩等级基础分
     if "fused_grade_num" in seg.columns:
-        seg["geo_prior_score"] += seg["fused_grade_num"].fillna(0) * 0.8
-
-    seg["geo_prior_score"] += active_source.fillna(0) * 0.9
-    seg["geo_prior_score"] += water_flag.fillna(0) * 1.2
-    seg["geo_prior_score"] += collapse_flag.fillna(0) * 1.6
-    seg["geo_prior_score"] += deformation_flag.fillna(0) * 1.2
-
-    x = weighted_strength.fillna(0)
-    if x.max() > x.min():
-        x_norm = (x - x.min()) / (x.max() - x.min())
+        seg["grade_score"] = seg["fused_grade_num"].fillna(0) * 0.8
     else:
-        x_norm = pd.Series(0, index=seg.index)
-    seg["geo_prior_score"] += x_norm * 1.2
+        seg["grade_score"] = 0.0
 
+    # 2) 多源一致性分
+    if weighted_strength.max() > weighted_strength.min():
+        weighted_strength_norm = (weighted_strength - weighted_strength.min()) / (
+            weighted_strength.max() - weighted_strength.min()
+        )
+    else:
+        weighted_strength_norm = pd.Series(0, index=seg.index)
+
+    seg["weighted_strength_norm"] = weighted_strength_norm
+
+    seg["consensus_score"] = (
+        active_source * 1.2 +
+        weighted_strength_norm * 1.5
+    )
+
+    # 3) hazard 文本拆解
     if "hazard" in seg.columns:
         seg["hazard"] = seg["hazard"].fillna("").astype(str)
-        seg["hazard_has_water"] = seg["hazard"].str.contains("出水|涌水|突水", regex=True).astype(int)
-        seg["hazard_has_collapse"] = seg["hazard"].str.contains("掉块|塌方|坍塌", regex=True).astype(int)
-        seg["hazard_has_deform"] = seg["hazard"].str.contains("变形", regex=True).astype(int)
 
-        seg["geo_prior_score"] += seg["hazard_has_water"] * 1.0
-        seg["geo_prior_score"] += seg["hazard_has_collapse"] * 1.4
-        seg["geo_prior_score"] += seg["hazard_has_deform"] * 1.0
+        seg["hazard_has_water"] = seg["hazard"].str.contains(
+            "出水|涌水|突水", regex=True
+        ).astype(int)
+
+        seg["hazard_has_collapse"] = seg["hazard"].str.contains(
+            "掉块|塌方|坍塌", regex=True
+        ).astype(int)
+
+        seg["hazard_has_deform"] = seg["hazard"].str.contains(
+            "变形", regex=True
+        ).astype(int)
+
+        seg["hazard_has_joint"] = seg["hazard"].str.contains(
+            "裂隙|节理", regex=True
+        ).astype(int)
+
+        seg["hazard_has_broken"] = seg["hazard"].str.contains(
+            "破碎|极破碎", regex=True
+        ).astype(int)
+
+        seg["hazard_has_reflection"] = seg["hazard"].str.contains(
+            "反射异常", regex=True
+        ).astype(int)
+
     else:
         seg["hazard_has_water"] = 0
         seg["hazard_has_collapse"] = 0
         seg["hazard_has_deform"] = 0
+        seg["hazard_has_joint"] = 0
+        seg["hazard_has_broken"] = 0
+        seg["hazard_has_reflection"] = 0
 
+    # 4) 去重后的基础危险信号
+    water_signal = np.maximum(water_flag, seg["hazard_has_water"])
+    collapse_signal = np.maximum(collapse_flag, seg["hazard_has_collapse"])
+    deform_signal = np.maximum(deformation_flag, seg["hazard_has_deform"])
+
+    seg["water_signal"] = water_signal
+    seg["collapse_signal"] = collapse_signal
+    seg["deform_signal"] = deform_signal
+
+    # 5) 工程门控逻辑（更严格）
+    seg["core_hazard"] = (
+        (water_signal == 1) &
+        (collapse_signal == 1) &
+        (active_source >= 2) &
+        (weighted_strength_norm > 0.45)
+    ).astype(int)
+
+    seg["mid_hazard"] = (
+        (
+            (water_signal == 1) |
+            (collapse_signal == 1)
+        ) &
+        (
+            (seg["hazard_has_joint"] == 1) |
+            (seg["hazard_has_broken"] == 1)
+        ) &
+        (active_source >= 2)
+    ).astype(int)
+
+    seg["light_hazard"] = (
+        (
+            (water_signal == 1) |
+            (collapse_signal == 1) |
+            (deform_signal == 1)
+        ) &
+        (seg["core_hazard"] == 0) &
+        (seg["mid_hazard"] == 0)
+    ).astype(int)
+
+    seg["structure_risk"] = (
+        seg["hazard_has_joint"] * 0.5 +
+        seg["hazard_has_broken"] * 0.7 +
+        seg["hazard_has_reflection"] * 0.4
+    )
+
+    # 6) 最终 hazard_score（整体降一点）
+    seg["hazard_score"] = (
+        seg["core_hazard"] * 2.5 +
+        seg["mid_hazard"] * 1.4 +
+        seg["light_hazard"] * 0.5 +
+        seg["structure_risk"] +
+        deform_signal * 0.7
+    )
+
+    # 7) 最终 geo_prior_score
+    seg["geo_prior_score"] = (
+        seg["grade_score"] +
+        seg["consensus_score"] +
+        seg["hazard_score"]
+    )
+
+    # 8) 分位数分级
     prior_q60 = seg["geo_prior_score"].quantile(0.60)
     prior_q75 = seg["geo_prior_score"].quantile(0.75)
 
@@ -351,11 +517,10 @@ def compute_future_response_features(
 
 
 # =========================
-# 改进版标签
+# 标签构造
 # =========================
-def build_response_based_label_v2(seg_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
+def build_response_based_label_v3(seg_df: pd.DataFrame) -> Tuple[pd.DataFrame, Dict[str, float]]:
     seg = seg_df.copy()
-
     active_source = get_col(seg, "active_source_count", "active_source_count_max")
 
     thresholds = {}
@@ -367,25 +532,11 @@ def build_response_based_label_v2(seg_df: pd.DataFrame) -> Tuple[pd.DataFrame, D
     thresholds["geo_prior_mid_q"] = float(seg["geo_prior_score"].quantile(0.60))
     thresholds["geo_prior_high_q"] = float(seg["geo_prior_score"].quantile(0.75))
 
-    seg["flag_future_slowdown"] = (
-        seg["future_speed_mean"] <= thresholds["speed_low_q35"]
-    ).astype(int)
-
-    seg["flag_future_high_thrust"] = (
-        seg["future_thrust_mean"] >= thresholds["thrust_high_q70"]
-    ).astype(int)
-
-    seg["flag_future_high_torque"] = (
-        seg["future_torque_mean"] >= thresholds["torque_high_q70"]
-    ).astype(int)
-
-    seg["flag_future_high_stop"] = (
-        seg["future_stop_ratio"] >= thresholds["stop_high_q65"]
-    ).astype(int)
-
-    seg["flag_future_fluctuation"] = (
-        seg["future_speed_std"] >= thresholds["speed_std_high_q70"]
-    ).astype(int)
+    seg["flag_future_slowdown"] = (seg["future_speed_mean"] <= thresholds["speed_low_q35"]).astype(int)
+    seg["flag_future_high_thrust"] = (seg["future_thrust_mean"] >= thresholds["thrust_high_q70"]).astype(int)
+    seg["flag_future_high_torque"] = (seg["future_torque_mean"] >= thresholds["torque_high_q70"]).astype(int)
+    seg["flag_future_high_stop"] = (seg["future_stop_ratio"] >= thresholds["stop_high_q65"]).astype(int)
+    seg["flag_future_fluctuation"] = (seg["future_speed_std"] >= thresholds["speed_std_high_q70"]).astype(int)
 
     seg["future_response_bad"] = (
         (
@@ -450,6 +601,7 @@ def prepare_training_data(seg: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Series, L
         "flag_future_high_torque", "flag_future_high_stop",
         "flag_future_fluctuation", "future_response_bad",
         "pure_stop_like",
+        "risk_prob", "risk_prob_smooth", "risk_level",
     }
 
     X = seg[[c for c in seg.columns if c not in exclude_cols]].copy()
@@ -499,17 +651,12 @@ def build_model(numeric_features: List[str], categorical_features: List[str]) ->
 
 
 def extract_feature_names_and_coefficients(clf: Pipeline) -> pd.DataFrame:
-    """
-    从训练好的 Pipeline 中提取最终实际进入模型的特征名和系数
-    这样可以避免手工拼接时与 sklearn 实际输出长度不一致
-    """
     preprocessor: ColumnTransformer = clf.named_steps["preprocessor"]
     model: LogisticRegression = clf.named_steps["model"]
 
     feature_names = preprocessor.get_feature_names_out()
     coef = model.coef_.ravel()
 
-    # 如果长度仍然不一致，做一个保护
     n = min(len(feature_names), len(coef))
     feature_names = feature_names[:n]
     coef = coef[:n]
@@ -524,49 +671,65 @@ def extract_feature_names_and_coefficients(clf: Pipeline) -> pd.DataFrame:
 
 
 # =========================
+# 风险后处理
+# =========================
+def classify_risk_level(p: float) -> str:
+    if pd.isna(p):
+        return "未知"
+    if p < 0.2:
+        return "低"
+    elif p < 0.3:
+        return "中"
+    return "高"
+
+
+def postprocess_risk_result(result_df: pd.DataFrame, smooth_window: int = 5) -> pd.DataFrame:
+    df = result_df.copy().sort_values("segment_start").reset_index(drop=True)
+    df["risk_prob_smooth"] = df["risk_prob"].rolling(smooth_window, center=True, min_periods=1).mean()
+    df["risk_level"] = df["risk_prob_smooth"].apply(classify_risk_level)
+    return df
+
+
+# =========================
 # 画图
 # =========================
 def plot_risk_profile(result_df: pd.DataFrame, output_dir: Path):
-    import matplotlib.pyplot as plt
-
     df = result_df.sort_values("segment_start").copy()
 
     plt.figure(figsize=(12, 5))
-    plt.plot(df["segment_start"], df["risk_prob"], linewidth=1.5)
+    plt.plot(df["segment_start"], df["risk_prob"], linewidth=1.0, alpha=0.5, label="Raw Risk")
+    plt.plot(df["segment_start"], df["risk_prob_smooth"], linewidth=2.0, label="Smoothed Risk")
+    plt.axhline(0.3, linestyle=":", alpha=0.7, label="Alert Threshold=0.3")
 
-    # ✅ 强制横坐标范围
     plt.xlim(1012000, 1018000)
-
-    # ✅ 关闭科学计数法
     plt.ticklabel_format(style="plain", axis="x")
-
     plt.xlabel("Chainage")
     plt.ylabel("Risk Probability")
     plt.title("Risk Probability Profile")
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(output_dir / "risk_probability_profile.png", dpi=200)
+    plt.savefig(output_dir / "risk_probability_profile.png", dpi=220)
     plt.close()
 
 
 def plot_risk_speed_coupling(result_df: pd.DataFrame, output_dir: Path):
     df = result_df.copy()
-
     if "speed_mean" not in df.columns:
         return
 
     plt.figure(figsize=(7, 5))
-    plt.scatter(df["risk_prob"], df["speed_mean"], alpha=0.7)
-    plt.xlabel("Risk Probability")
+    plt.scatter(df["risk_prob_smooth"], df["speed_mean"], alpha=0.65)
+    plt.axvline(0.3, linestyle=":", alpha=0.7)
+    plt.xlabel("Smoothed Risk Probability")
     plt.ylabel("Mean Advance Speed")
     plt.title("Risk Probability vs Advance Speed")
     plt.tight_layout()
-    plt.savefig(output_dir / "risk_speed_coupling.png", dpi=200)
+    plt.savefig(output_dir / "risk_speed_coupling.png", dpi=220)
     plt.close()
 
-def plot_risk_speed_profile(result_df, output_dir):
-    import matplotlib.pyplot as plt
-    import numpy as np
-    import matplotlib.ticker as mticker
+
+def plot_risk_speed_profile(result_df: pd.DataFrame, output_dir: Path):
+    plt.style.use("seaborn-v0_8-whitegrid")
 
     df = result_df.sort_values("segment_start").copy()
     df = df[(df["segment_start"] >= 1012000) & (df["segment_start"] <= 1018000)]
@@ -576,60 +739,75 @@ def plot_risk_speed_profile(result_df, output_dir):
         return
 
     x = df["segment_start"]
-    risk = df["risk_prob"]
+    risk_raw = df["risk_prob"]
+    risk_smooth = df["risk_prob_smooth"]
     speed = df["speed_mean"]
 
-    # 设置主题风格（可选）
-    plt.style.use('seaborn-v0_8-whitegrid') 
     fig, ax1 = plt.subplots(figsize=(15, 7))
 
-    # ======================
-    # 1️⃣ 风险概率（左轴 - 红色）
-    # ======================
-    # 显式指定 color='tab:red'
-    ax1.plot(x, risk, color='tab:red', linewidth=1.5, label="Risk Probability", zorder=3)
-    
-    # 填充高风险区域（>0.6）
-    ax1.fill_between(x, 0, risk, where=(risk > 0.6), color='tab:red', alpha=0.2, label="High Risk (>0.6)")
-    
-    # 画一条 0.6 的警戒参考线
-    ax1.axhline(y=0.6, color='tab:red', linestyle=':', alpha=0.5)
+    ax1.plot(x, risk_raw, color="tab:red", linewidth=1.0, alpha=0.35, label="Risk Probability")
+    ax1.plot(x, risk_smooth, color="tab:red", linewidth=2.3, label="Smoothed Risk")
+    ax1.fill_between(x, 0, risk_smooth, where=(risk_smooth > 0.3), color="tab:red", alpha=0.18, label="High Risk Zone")
+    ax1.axhline(y=0.3, color="tab:red", linestyle=":", alpha=0.55)
 
-    ax1.set_ylabel("Risk Probability", color='tab:red', fontsize=12, fontweight='bold')
+    ax1.set_ylabel("Risk Probability", color="tab:red", fontsize=12, fontweight="bold")
     ax1.set_ylim(0, 1.05)
-    ax1.tick_params(axis='y', labelcolor='tab:red')
+    ax1.tick_params(axis="y", labelcolor="tab:red")
 
-    # ======================
-    # 2️⃣ 推进速度（右轴 - 蓝色/青色）
-    # ======================
     ax2 = ax1.twinx()
-    # 建议速度用深一点的颜色，避免和背景混淆
-    ax2.plot(x, speed, color='tab:blue', linestyle='--', alpha=0.8, label="Advance Speed", zorder=2)
-    
-    ax2.set_ylabel("Advance Speed (m/min)", color='tab:blue', fontsize=12, fontweight='bold')
-    ax2.tick_params(axis='y', labelcolor='tab:blue')
-    ax2.grid(False) # 关掉右轴网格，避免画面太乱
+    ax2.plot(x, speed, color="tab:blue", linestyle="--", linewidth=1.6, alpha=0.8, label="Advance Speed")
+    ax2.set_ylabel("Advance Speed", color="tab:blue", fontsize=12, fontweight="bold")
+    ax2.tick_params(axis="y", labelcolor="tab:blue")
+    ax2.grid(False)
 
-    # ======================
-    # 3️⃣ 细节优化
-    # ======================
-    # X轴格式化
     ax1.set_xlim(1012000, 1018000)
-    def format_chainage(x, pos=None):
-        return f"DK{x/1000:.3f}"
-    ax1.xaxis.set_major_formatter(mticker.FuncFormatter(format_chainage))
-    ax1.set_xlabel("Chainage (m)", fontsize=11)
 
-    # 整合图例
+    def format_chainage(v, pos=None):
+        return f"DK{v / 1000:.3f}"
+
+    ax1.xaxis.set_major_formatter(mticker.FuncFormatter(format_chainage))
+    ax1.set_xlabel("Chainage", fontsize=11)
+
     lines1, labels1 = ax1.get_legend_handles_labels()
     lines2, labels2 = ax2.get_legend_handles_labels()
-    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=True, shadow=True)
+    ax1.legend(lines1 + lines2, labels1 + labels2, loc="upper left", frameon=True)
 
     plt.title("Tunnel Boring Machine Risk & Speed Profile", fontsize=14, pad=15)
-    
     plt.tight_layout()
-    plt.savefig(output_dir / "risk_speed_profile_optimized.png", dpi=300) # 提高DPI更清晰
-    plt.show()
+    plt.savefig(output_dir / "risk_speed_profile_optimized.png", dpi=300)
+    plt.close()
+
+
+def plot_risk_level_profile(result_df: pd.DataFrame, output_dir: Path):
+    df = result_df.sort_values("segment_start").copy()
+    df = df[(df["segment_start"] >= 1012000) & (df["segment_start"] <= 1018000)]
+
+    if df.empty:
+        return
+
+    plt.figure(figsize=(15, 3.8))
+    x = df["segment_start"]
+
+    low = (df["risk_level"] == "低").astype(int)
+    mid = (df["risk_level"] == "中").astype(int)
+    high = (df["risk_level"] == "高").astype(int)
+
+    plt.fill_between(x, 0, 1, where=low > 0, alpha=0.20, label="低风险")
+    plt.fill_between(x, 0, 1, where=mid > 0, alpha=0.35, label="中风险")
+    plt.fill_between(x, 0, 1, where=high > 0, alpha=0.45, label="高风险")
+
+    plt.xlim(1012000, 1018000)
+    plt.ylim(0, 1)
+    plt.yticks([])
+    plt.xlabel("Chainage")
+    plt.title("Risk Level Zonation")
+    plt.ticklabel_format(style="plain", axis="x")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(output_dir / "risk_level_profile.png", dpi=220)
+    plt.close()
+
+
 # =========================
 # 训练
 # =========================
@@ -655,7 +833,6 @@ def train_probability_model(seg_df: pd.DataFrame, output_dir: Path):
     test_df["risk_prob"] = clf.predict_proba(X_test)[:, 1]
 
     metrics = {}
-
     try:
         metrics["train_auc"] = float(roc_auc_score(y_train, train_df["risk_prob"]))
     except Exception:
@@ -671,7 +848,8 @@ def train_probability_model(seg_df: pd.DataFrame, output_dir: Path):
     except Exception:
         metrics["test_ap"] = None
 
-    test_pred = (test_df["risk_prob"] >= 0.5).astype(int)
+    test_pred = (test_df["risk_prob"] >= 0.3).astype(int)
+    metrics["decision_threshold"] = 0.3
     metrics["test_confusion_matrix"] = confusion_matrix(y_test, test_pred).tolist()
     metrics["test_classification_report"] = classification_report(
         y_test, test_pred, digits=4, output_dict=True, zero_division=0
@@ -682,18 +860,21 @@ def train_probability_model(seg_df: pd.DataFrame, output_dir: Path):
         test_df.assign(split="test")
     ], axis=0).sort_values("segment_start").reset_index(drop=True)
 
+    result_df = postprocess_risk_result(result_df, smooth_window=5)
     coef_df = extract_feature_names_and_coefficients(clf)
 
-    joblib.dump(clf, output_dir / "risk_probability_model_v2.joblib")
-    result_df.to_csv(output_dir / "segment_risk_predictions_v2.csv", index=False, encoding="utf-8-sig")
-    coef_df.to_csv(output_dir / "feature_coefficients_v2.csv", index=False, encoding="utf-8-sig")
+    joblib.dump(clf, output_dir / "risk_probability_model_v3.joblib")
+    result_df.to_csv(output_dir / "segment_risk_predictions_v3.csv", index=False, encoding="utf-8-sig")
+    coef_df.to_csv(output_dir / "feature_coefficients_v3.csv", index=False, encoding="utf-8-sig")
 
-    with open(output_dir / "metrics_v2.json", "w", encoding="utf-8") as f:
+    with open(output_dir / "metrics_v3.json", "w", encoding="utf-8") as f:
         json.dump(metrics, f, ensure_ascii=False, indent=2)
 
     plot_risk_profile(result_df, output_dir)
     plot_risk_speed_coupling(result_df, output_dir)
     plot_risk_speed_profile(result_df, output_dir)
+    plot_risk_level_profile(result_df, output_dir)
+
     return clf, result_df, coef_df, metrics
 
 
@@ -705,28 +886,28 @@ def run(
     evidence_db_path: str,
     output_dir: str,
     segment_len: float,
-    future_window_m: float
+    future_window_m: float,
+    force_rebuild: bool = False
 ):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[INFO] 读取 PLC 数据: {plc_path}")
-    plc_df = pd.read_csv(plc_path)
-    plc_df = ensure_time_chainage(plc_df)
-    print(f"[INFO] PLC 样本数: {len(plc_df)}")
-
-    print(f"[INFO] 读取证据库: {evidence_db_path}")
-    evidence_df = load_evidence_db(evidence_db_path)
-
-    print("[INFO] 挂接地质融合标签...")
-    df_geo = attach_geology_labels(plc_df, evidence_df)
-    df_geo = ensure_time_chainage(df_geo)
+    df_geo = load_or_build_fused_df(
+        plc_path=plc_path,
+        evidence_db_path=evidence_db_path,
+        output_dir=output_dir,
+        force_rebuild=force_rebuild,
+    )
+    print(f"[INFO] 融合后样本数: {len(df_geo)}")
 
     print("[INFO] 添加区段编号...")
     df_geo = add_segment_id(df_geo, segment_len=segment_len)
 
     print("[INFO] 构造区段级特征...")
     seg_df = build_segment_features(df_geo)
+
+    print("[INFO] 增加趋势特征...")
+    seg_df = add_trend_features(seg_df)
 
     print("[DEBUG] seg_df columns:")
     print(seg_df.columns.tolist())
@@ -738,44 +919,47 @@ def run(
     seg_df = compute_future_response_features(seg_df, future_window_m=future_window_m)
 
     print("[INFO] 构造改进版标签...")
-    seg_df, thresholds = build_response_based_label_v2(seg_df)
+    seg_df, thresholds = build_response_based_label_v3(seg_df)
 
-    seg_df.to_csv(output_dir / "segment_features_with_labels_v2.csv", index=False, encoding="utf-8-sig")
+    seg_df.to_csv(output_dir / "segment_features_with_labels_v3.csv", index=False, encoding="utf-8-sig")
 
-    with open(output_dir / "label_thresholds_v2.json", "w", encoding="utf-8") as f:
+    with open(output_dir / "label_thresholds_v3.json", "w", encoding="utf-8") as f:
         json.dump(thresholds, f, ensure_ascii=False, indent=2)
 
     print("[INFO] 开始训练模型...")
     clf, result_df, coef_df, metrics = train_probability_model(seg_df, output_dir)
 
     print("[INFO] 完成。输出如下：")
-    print(output_dir / "segment_features_with_labels_v2.csv")
-    print(output_dir / "segment_risk_predictions_v2.csv")
-    print(output_dir / "risk_probability_model_v2.joblib")
-    print(output_dir / "feature_coefficients_v2.csv")
-    print(output_dir / "metrics_v2.json")
+    print(output_dir / "segment_features_with_labels_v3.csv")
+    print(output_dir / "segment_risk_predictions_v3.csv")
+    print(output_dir / "risk_probability_model_v3.joblib")
+    print(output_dir / "feature_coefficients_v3.csv")
+    print(output_dir / "metrics_v3.json")
     print(output_dir / "risk_probability_profile.png")
     print(output_dir / "risk_speed_coupling.png")
+    print(output_dir / "risk_speed_profile_optimized.png")
+    print(output_dir / "risk_level_profile.png")
 
     show_cols = [c for c in [
-        "segment_start", "segment_end", "risk_prob", "label_risk",
-        "geo_prior_score", "fused_grade", "hazard", "active_source_count",
+        "segment_start", "segment_end", "risk_prob", "risk_prob_smooth", "risk_level",
+        "label_risk", "geo_prior_score", "fused_grade", "hazard", "active_source_count",
         "speed_mean", "thrust_mean", "torque_mean", "stop_ratio"
     ] if c in result_df.columns]
 
     print("\n[INFO] 风险概率最高的前20个区段：")
     print(
-        result_df.sort_values("risk_prob", ascending=False)[show_cols]
+        result_df.sort_values("risk_prob_smooth", ascending=False)[show_cols]
         .head(20)
         .to_string(index=False)
     )
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="TBM 风险概率模型 v2")
-    parser.add_argument("--output_dir", type=str, default="outputs/risk_model_b_v2")
+    parser = argparse.ArgumentParser(description="TBM 风险概率模型 v3")
+    parser.add_argument("--output_dir", type=str, default="outputs/risk_model_b_v3")
     parser.add_argument("--segment_len", type=float, default=10.0)
     parser.add_argument("--future_window_m", type=float, default=10.0)
+    parser.add_argument("--force_rebuild", action="store_true", help="强制重新做地质融合并覆盖缓存")
     return parser.parse_args()
 
 
@@ -787,5 +971,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         segment_len=args.segment_len,
         future_window_m=args.future_window_m,
+        force_rebuild=args.force_rebuild,
     )
-   

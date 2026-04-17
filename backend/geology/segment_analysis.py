@@ -48,6 +48,7 @@ def aggregate_segments(df: pd.DataFrame):
         "主皮带反转压力",
         "主皮带正转压力",
         "risk_score",
+        "geo_prior_score",
         "active_source_count",
         "water_flag_fused",
         "collapse_flag_fused",
@@ -63,7 +64,7 @@ def aggregate_segments(df: pd.DataFrame):
     }
 
     for col in existing_numeric:
-        if col in ["risk_score", "active_source_count",
+        if col in ["risk_score", "geo_prior_score", "active_source_count",
                    "water_flag_fused", "collapse_flag_fused", "deformation_flag_fused"]:
             agg_dict[col] = ["max", "mean"]
         else:
@@ -82,7 +83,6 @@ def aggregate_segments(df: pd.DataFrame):
 
     grouped = out.groupby("segment_id").agg(agg_dict)
 
-    # 展平列名
     new_cols = []
     for col in grouped.columns:
         if isinstance(col, tuple):
@@ -97,7 +97,6 @@ def aggregate_segments(df: pd.DataFrame):
     grouped = grouped.reset_index()
 
     return grouped
-
 
 def _format_dk(x):
     """
@@ -148,11 +147,20 @@ def analyze_segment_response(df: pd.DataFrame):
     speed_col = "推进速度_mean" if "推进速度_mean" in out.columns else None
     thrust_col = "推力_mean" if "推力_mean" in out.columns else None
     torque_col = "刀盘扭矩_mean" if "刀盘扭矩_mean" in out.columns else None
-    risk_col = "risk_score_max" if "risk_score_max" in out.columns else None
+
+    if "risk_score_max" in out.columns:
+        risk_col = "risk_score_max"
+    elif "geo_prior_score_max" in out.columns:
+        risk_col = "geo_prior_score_max"
+    elif "geo_prior_score_mean" in out.columns:
+        risk_col = "geo_prior_score_mean"
+    else:
+        risk_col = None
+
     source_col = "active_source_count_max" if "active_source_count_max" in out.columns else None
 
     if speed_col is None or risk_col is None:
-        out["interpretation"] = "缺少必要字段，无法进行区段响应分析"
+        out["interpretation"] = "当前区段级施工响应关联条件仍不充分，判读结果需谨慎解释"
         return out
 
     global_speed = out[speed_col].mean(skipna=True)
@@ -199,7 +207,6 @@ def analyze_segment_response(df: pd.DataFrame):
                 interpretations.append("低风险区段，施工正常")
 
     out["interpretation"] = interpretations
-
     return out
 
 
